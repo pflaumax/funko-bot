@@ -415,14 +415,6 @@ def main_check_job(
 
         logger.info(f"Found {len(products_to_post)} new products to post")
 
-        # Check for price drops
-        if config.price_drop_threshold > 0:
-            price_drops = scraper.check_price_drops(posted_products)
-            for product in price_drops:
-                if product.get("price_drop", 0) >= config.price_drop_threshold:
-                    products_to_post.append(product)
-            logger.info(f"Found {len(price_drops)} significant price drops")
-
         # Apply rate limiting
         if max_posts_per_check > 0 and len(products_to_post) > max_posts_per_check:
             logger.info(
