@@ -92,7 +92,6 @@ def main():
         logger.info("Initializing Funko scraper...")
         scraper = FunkoScraper(
             region=config.funko_region,
-            max_products=config.max_products_to_scrape,
             pages=config.scrape_pages,
         )
 
