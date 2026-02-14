@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  funko-bot:
+    build: .
+    container_name: funko-bluesky-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=America/New_York
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

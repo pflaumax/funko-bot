@@ -1,0 +1,27 @@
+[Unit]
+Description=Funko Bluesky Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=your-username
+Group=your-username
+WorkingDirectory=/path/to/funko-bluesky-bot
+Environment="PATH=/path/to/funko-bluesky-bot/venv/bin"
+ExecStart=/path/to/funko-bluesky-bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=funko-bot
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/path/to/funko-bluesky-bot/data /path/to/funko-bluesky-bot/logs
+
+[Install]
+WantedBy=multi-user.target
