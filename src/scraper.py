@@ -131,6 +131,14 @@ class FunkoScraper:
         for attempt in range(1, 3):
             try:
                 logger.info(f"Fetching {url} (attempt {attempt}/2)")
+
+                # Add random delay to avoid detection (3-8 seconds)
+                import random
+
+                delay = random.uniform(3, 8)
+                logger.debug(f"Waiting {delay:.1f}s before request")
+                time.sleep(delay)
+
                 resp = self.session.get(url, timeout=30, allow_redirects=True)
                 resp.raise_for_status()
                 logger.info(f"Got {len(resp.text)} chars")
@@ -139,16 +147,19 @@ class FunkoScraper:
                 status = e.response.status_code if e.response is not None else 0
                 logger.warning(f"HTTP {status} for {url}")
                 if status == 403:
-                    logger.warning("Cloudflare blocked — will fall back to GitHub data")
+                    logger.warning("Cloudflare blocked — retrying with longer delay")
+                    if attempt < 2:
+                        time.sleep(random.uniform(10, 20))
+                        continue
                     return None
                 if attempt < 2:
-                    time.sleep(3)
+                    time.sleep(5)
                     continue
                 return None
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error: {e}")
                 if attempt < 2:
-                    time.sleep(3)
+                    time.sleep(5)
                     continue
                 return None
         return None
