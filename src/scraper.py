@@ -83,6 +83,8 @@ class FunkoScraper:
                     Leave empty for US store (USD).
             pages: List of page types to scrape (e.g. ['sale', 'new-releases', 'exclusives']).
         """
+        from config.settings import config
+        
         self.session = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "darwin", "mobile": False}
         )
@@ -90,6 +92,8 @@ class FunkoScraper:
         self.currency = REGION_CURRENCY_MAP.get(region.lower(), "EUR")
         self.pages = pages or ["sale"]
         self.last_request_time = 0
+        self.delay_min = config.scrape_delay_min
+        self.delay_max = config.scrape_delay_max
 
         # Build base URL
         if region:
@@ -99,7 +103,8 @@ class FunkoScraper:
 
         logger.info(
             f"Scraper initialized — region: {region or 'US'}, "
-            f"currency: {self.currency}, pages: {self.pages}"
+            f"currency: {self.currency}, pages: {self.pages}, "
+            f"delays: {self.delay_min}-{self.delay_max}s"
         )
 
     def _rate_limit(self) -> None:
@@ -118,51 +123,51 @@ class FunkoScraper:
     # ------------------------------------------------------------------
 
     def _fetch_page(self, url: str) -> Optional[str]:
-        """Fetch a page via cloudscraper with one retry.
+            """Fetch a page via cloudscraper with one retry.
 
-        Args:
-            url: URL to fetch.
+            Args:
+                url: URL to fetch.
 
-        Returns:
-            HTML string or None on failure.
-        """
-        self._rate_limit()
+            Returns:
+                HTML string or None on failure.
+            """
+            self._rate_limit()
 
-        for attempt in range(1, 3):
-            try:
-                logger.info(f"Fetching {url} (attempt {attempt}/2)")
+            for attempt in range(1, 3):
+                try:
+                    logger.info(f"Fetching {url} (attempt {attempt}/2)")
 
-                # Add random delay to avoid detection (3-8 seconds)
-                import random
+                    # Add random delay to avoid detection
+                    import random
 
-                delay = random.uniform(3, 8)
-                logger.debug(f"Waiting {delay:.1f}s before request")
-                time.sleep(delay)
+                    delay = random.uniform(self.delay_min, self.delay_max)
+                    logger.debug(f"Waiting {delay:.1f}s before request")
+                    time.sleep(delay)
 
-                resp = self.session.get(url, timeout=30, allow_redirects=True)
-                resp.raise_for_status()
-                logger.info(f"Got {len(resp.text)} chars")
-                return resp.text
-            except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response is not None else 0
-                logger.warning(f"HTTP {status} for {url}")
-                if status == 403:
-                    logger.warning("Cloudflare blocked — retrying with longer delay")
+                    resp = self.session.get(url, timeout=30, allow_redirects=True)
+                    resp.raise_for_status()
+                    logger.info(f"Got {len(resp.text)} chars")
+                    return resp.text
+                except requests.exceptions.HTTPError as e:
+                    status = e.response.status_code if e.response is not None else 0
+                    logger.warning(f"HTTP {status} for {url}")
+                    if status == 403:
+                        logger.warning("Cloudflare blocked — retrying with longer delay")
+                        if attempt < 2:
+                            time.sleep(random.uniform(self.delay_max * 2, self.delay_max * 3))
+                            continue
+                        return None
                     if attempt < 2:
-                        time.sleep(random.uniform(10, 20))
+                        time.sleep(5)
                         continue
                     return None
-                if attempt < 2:
-                    time.sleep(5)
-                    continue
-                return None
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error: {e}")
-                if attempt < 2:
-                    time.sleep(5)
-                    continue
-                return None
-        return None
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request error: {e}")
+                    if attempt < 2:
+                        time.sleep(5)
+                        continue
+                    return None
+            return None
 
     def _parse_sale_page(self, html: str, page_type: str = "sale") -> List[Dict]:
         """Parse product tiles from the funko.com page HTML.

@@ -44,6 +44,8 @@ class BotConfig:
     max_posts_per_check: int
     post_delay_seconds: int
     scrape_pages: List[str]
+    scrape_delay_min: int
+    scrape_delay_max: int
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -82,6 +84,8 @@ class BotConfig:
             max_posts_per_check=int(os.getenv("MAX_POSTS_PER_CHECK", "0")),
             post_delay_seconds=int(os.getenv("POST_DELAY_SECONDS", "0")),
             scrape_pages=scrape_pages,
+            scrape_delay_min=int(os.getenv("SCRAPE_DELAY_MIN", "3")),
+            scrape_delay_max=int(os.getenv("SCRAPE_DELAY_MAX", "8")),
         )
 
 
