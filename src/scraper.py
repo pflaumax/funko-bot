@@ -1,6 +1,6 @@
 """Funko product scraper for monitoring sale items.
 
-Scrapes the funko.com pages using cloudscraper to bypass Cloudflare.
+Scrapes the funko.com pages using curl_cffi to bypass Cloudflare.
 Region is configurable (default: /pl/ for Poland/EUR).
 Falls back to the kennymkchan/funko-pop-data GitHub dataset if the
 live site is unreachable.
@@ -14,7 +14,7 @@ from datetime import datetime
 from random import sample
 
 import requests
-import cloudscraper
+from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
 
@@ -66,7 +66,7 @@ REGION_CURRENCY_MAP = {
 class FunkoScraper:
     """Scraper for Funko Pop sale products from funko.com.
 
-    Uses cloudscraper to bypass Cloudflare protection. Targets the
+    Uses curl_cffi to bypass Cloudflare protection. Targets the
     sale page specifically. Region is configurable via FUNKO_REGION
     env var (default: pl for Poland/EUR).
     """
@@ -85,9 +85,7 @@ class FunkoScraper:
         """
         from config.settings import config
         
-        self.session = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "darwin", "mobile": False}
-        )
+        self.session = curl_requests.Session(impersonate="chrome131")
         self.region = region
         self.currency = REGION_CURRENCY_MAP.get(region.lower(), "EUR")
         self.pages = pages or ["sale"]
