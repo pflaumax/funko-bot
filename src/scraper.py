@@ -6,17 +6,16 @@ Falls back to the kennymkchan/funko-pop-data GitHub dataset if the
 live site is unreachable.
 """
 
-import time
-import logging
 import hashlib
-from typing import List, Dict, Optional
+import logging
+import random
+import re
+import time
 from datetime import datetime
-from random import sample
 
-import requests
-from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
-
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests import exceptions as curl_exceptions
 
 logger = logging.getLogger("funko_bot.scraper")
 
@@ -63,6 +62,65 @@ REGION_CURRENCY_MAP = {
 }
 
 
+# Fandoms never worth posting: sports leagues have no crossover with this
+# feed's audience, and Disney floods every page. Matched as substrings
+# against both the fandom and the raw license.
+EXCLUDED_FANDOMS = frozenset(
+    {
+        "mlb",
+        "mls",
+        "nfl",
+        "nba",
+        "nhl",
+        "disney",
+        "baseball",
+        "basketball",
+        "hockey",
+    }
+)
+
+
+# Trailing noise the CDN appends to every image alt attribute, e.g.
+# "Pop! Fuecoco, , hi-res view 1". Product names themselves never end in
+# one of these, so stripping is safe.
+ALT_NOISE_RE = re.compile(
+    r"(?:,\s*)+(?:hi-res view|image)\s*\d*\s*$",
+    re.IGNORECASE,
+)
+
+
+def clean_product_name(raw: str) -> str:
+    """Strip CDN alt-attribute noise and collapse whitespace.
+
+    Args:
+        raw: Name as scraped, possibly with a ", , hi-res view 1" suffix.
+
+    Returns:
+        The bare product name.
+    """
+    name = ALT_NOISE_RE.sub("", raw or "")
+    name = re.sub(r"\s+", " ", name)
+    return name.strip().strip(",").strip()
+
+
+def product_key(name: str) -> str:
+    """Build the dedup key for a product.
+
+    Keyed on the cleaned name rather than the URL because the posted-products
+    ledger only ever recorded names, so this is the one scheme the existing
+    history can be migrated to. Names carry their variant in parentheses
+    ("Pop! Doflamingo (Flocked)"), so they are unique per product.
+
+    Args:
+        name: Product name, cleaned or raw.
+
+    Returns:
+        16-character hex key.
+    """
+    normalized = clean_product_name(name).casefold()
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 class FunkoScraper:
     """Scraper for Funko Pop sale products from funko.com.
 
@@ -74,14 +132,14 @@ class FunkoScraper:
     def __init__(
         self,
         region: str = "pl",
-        pages: List[str] = None,
+        pages: list[str] = None,
     ):
         """Initialize the scraper.
 
         Args:
             region: Funko region code (e.g. 'pl', 'ro', 'de', 'fr', 'gb', 'uk').
                     Leave empty for US store (USD).
-            pages: List of page types to scrape (e.g. ['sale', 'new-releases', 'exclusives']).
+            pages: Page types to scrape, e.g. ['sale', 'new-releases'].
         """
         from config.settings import config
         
@@ -113,61 +171,78 @@ class FunkoScraper:
         self.last_request_time = time.time()
 
     def _generate_product_id(self, name: str, url: str) -> str:
-        """Generate a unique product ID from name and URL."""
-        return hashlib.md5(f"{name}_{url}".encode()).hexdigest()[:16]
+        """Generate the stable dedup ID for a product.
+
+        Args:
+            name: Product name.
+            url: Product URL, kept for call-site compatibility but unused —
+                see product_key() for why the name is the key.
+
+        Returns:
+            16-character hex key.
+        """
+        return product_key(name)
 
     # ------------------------------------------------------------------
     # Primary source: funko.com sale page
     # ------------------------------------------------------------------
 
-    def _fetch_page(self, url: str) -> Optional[str]:
-            """Fetch a page via cloudscraper with one retry.
+    def _fetch_page(self, url: str) -> str | None:
+        """Fetch a page with one retry, backing off harder on a 403.
 
-            Args:
-                url: URL to fetch.
+        The exception types here must come from curl_cffi, not requests:
+        curl_cffi.requests.exceptions.HTTPError descends from OSError, not
+        from requests.exceptions.HTTPError, so catching the requests ones
+        silently disables every retry below.
 
-            Returns:
-                HTML string or None on failure.
-            """
-            self._rate_limit()
+        Args:
+            url: URL to fetch.
 
-            for attempt in range(1, 3):
-                try:
-                    logger.info(f"Fetching {url} (attempt {attempt}/2)")
+        Returns:
+            HTML string or None on failure.
+        """
+        self._rate_limit()
 
-                    # Add random delay to avoid detection
-                    import random
+        for attempt in range(1, 3):
+            try:
+                logger.info(f"Fetching {url} (attempt {attempt}/2)")
 
-                    delay = random.uniform(self.delay_min, self.delay_max)
-                    logger.debug(f"Waiting {delay:.1f}s before request")
-                    time.sleep(delay)
+                # Random delay to avoid detection
+                delay = random.uniform(self.delay_min, self.delay_max)
+                logger.debug(f"Waiting {delay:.1f}s before request")
+                time.sleep(delay)
 
-                    resp = self.session.get(url, timeout=30, allow_redirects=True)
-                    resp.raise_for_status()
-                    logger.info(f"Got {len(resp.text)} chars")
-                    return resp.text
-                except requests.exceptions.HTTPError as e:
-                    status = e.response.status_code if e.response is not None else 0
-                    logger.warning(f"HTTP {status} for {url}")
-                    if status == 403:
-                        logger.warning("Cloudflare blocked — retrying with longer delay")
-                        if attempt < 2:
-                            time.sleep(random.uniform(self.delay_max * 2, self.delay_max * 3))
-                            continue
-                        return None
+                resp = self.session.get(url, timeout=30, allow_redirects=True)
+                resp.raise_for_status()
+                logger.info(f"Got {len(resp.text)} chars")
+                return resp.text
+
+            except curl_exceptions.HTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", 0) or 0
+                logger.warning(f"HTTP {status} for {url}")
+                if status == 403:
+                    logger.warning("Cloudflare blocked — retrying with longer delay")
                     if attempt < 2:
-                        time.sleep(5)
+                        time.sleep(
+                            random.uniform(self.delay_max * 2, self.delay_max * 3)
+                        )
                         continue
                     return None
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Request error: {e}")
-                    if attempt < 2:
-                        time.sleep(5)
-                        continue
-                    return None
-            return None
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return None
 
-    def _parse_sale_page(self, html: str, page_type: str = "sale") -> List[Dict]:
+            except curl_exceptions.RequestException as e:
+                logger.error(f"Request error: {e}")
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return None
+
+        return None
+
+    def _parse_sale_page(self, html: str, page_type: str = "sale") -> list[dict]:
         """Parse product tiles from the funko.com page HTML.
 
         The page uses `.product-tile` divs with this structure:
@@ -196,12 +271,12 @@ class FunkoScraper:
                 if product:
                     products.append(product)
             except Exception as e:
-                logger.error(f"Failed to parse tile: {e}", exc_info=True)
+                logger.exception(f"Failed to parse tile: {e}")
                 continue
 
         return products
 
-    def _parse_tile(self, tile, page_type: str = "sale") -> Optional[Dict]:
+    def _parse_tile(self, tile, page_type: str = "sale") -> dict | None:
         """Parse a single product tile element.
 
         Args:
@@ -215,7 +290,13 @@ class FunkoScraper:
         img = tile.find("img", class_="tile-main-image")
         if not img:
             return None
-        name = img.get("alt", "").replace(", Image 1", "").strip()
+
+        # div.product-name carries the bare title; the image alt is a
+        # fallback only, and always needs the CDN suffix stripped off.
+        name_el = tile.find("div", class_="product-name")
+        name = clean_product_name(
+            name_el.get_text(strip=True) if name_el else img.get("alt", "")
+        )
         if not name:
             return None
         image_url = img.get("src", "")
@@ -223,7 +304,7 @@ class FunkoScraper:
         # Upgrade image resolution: replace sw=346&sh=346 with sw=800&sh=800
         if image_url and "sw=346" in image_url:
             image_url = image_url.replace("sw=346&sh=346", "sw=800&sh=800")
-            logger.debug(f"Upgraded image URL to 800x800")
+            logger.debug("Upgraded image URL to 800x800")
 
         # Get alternate image (often in-box or lifestyle shot)
         alt_img = tile.find("img", class_="tile-alt-hover-image")
@@ -232,7 +313,7 @@ class FunkoScraper:
             image_url_alt = alt_img.get("src", "")
             if image_url_alt and "sw=346" in image_url_alt:
                 image_url_alt = image_url_alt.replace("sw=346&sh=346", "sw=800&sh=800")
-                logger.debug(f"Upgraded alt image URL to 800x800")
+                logger.debug("Upgraded alt image URL to 800x800")
 
         # Product URL
         link = tile.find("a", class_="image-link")
@@ -285,8 +366,6 @@ class FunkoScraper:
                 coming_soon = True
                 # Try to extract date from various formats
                 # Example: "Drops 16/02 at 05:30 PM GMT"
-                import re
-
                 date_match = re.search(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", avail_text)
                 time_match = re.search(
                     r"(\d{1,2}:\d{2}\s*(?:AM|PM)?(?:\s*GMT)?)",
@@ -341,7 +420,7 @@ class FunkoScraper:
     # Public API
     # ------------------------------------------------------------------
 
-    def filter_by_fandom(self, products: List[Dict], fandoms: List[str]) -> List[Dict]:
+    def filter_by_fandom(self, products: list[dict], fandoms: list[str]) -> list[dict]:
         """Filter products by fandom list.
 
         Args:
@@ -351,20 +430,7 @@ class FunkoScraper:
         Returns:
             Filtered product list.
         """
-        # Excluded fandoms (specific sports leagues, Disney, etc.)
-        excluded_fandoms = {
-            "mlb",  # Major League Baseball
-            "mls",  # Major League Soccer
-            "nfl",  # National Football League
-            "nba",  # National Basketball Association
-            "nhl",  # National Hockey League
-            "disney",  # Disney
-            "baseball",  # Baseball
-            "basketball",  # Basketball
-            "hockey",  # Hockey
-        }
-
-        # First, filter out excluded fandoms
+        # Always drop the excluded fandoms first, allowlist second.
         filtered = []
         for p in products:
             fandom = p.get("fandom", "").lower()
@@ -372,7 +438,7 @@ class FunkoScraper:
 
             # Check if fandom or license matches any excluded category
             is_excluded = False
-            for excluded in excluded_fandoms:
+            for excluded in EXCLUDED_FANDOMS:
                 if excluded in fandom or excluded in license_name:
                     is_excluded = True
                     break
@@ -383,7 +449,8 @@ class FunkoScraper:
         excluded_count = len(products) - len(filtered)
         if excluded_count > 0:
             logger.info(
-                f"Excluded {excluded_count} products from unwanted fandoms (MLB, MLS, NBA, NFL, NHL, Disney, etc.)"
+                f"Excluded {excluded_count} products from unwanted fandoms "
+                f"({', '.join(sorted(EXCLUDED_FANDOMS))})"
             )
 
         # Then apply fandom filter if specified
@@ -399,7 +466,7 @@ class FunkoScraper:
         )
         return final_filtered
 
-    def get_new_products(self, fandoms: List[str]) -> List[Dict]:
+    def get_new_products(self, fandoms: list[str]) -> list[dict]:
         """Fetch products from multiple pages.
 
         Args:
@@ -448,9 +515,7 @@ class FunkoScraper:
             logger.info(f"Total unique products from all pages: {len(all_products)}")
 
             # Shuffle products to mix different page types
-            from random import shuffle
-
-            shuffle(all_products)
+            random.shuffle(all_products)
             logger.info("Shuffled products for variety")
 
             # Filter by fandom
@@ -461,40 +526,3 @@ class FunkoScraper:
         # No products found
         logger.warning("No products found from any page")
         return []
-
-    def check_price_drops(self, previous_products: Dict[str, Dict]) -> List[Dict]:
-        """Check for price drops vs previously seen products.
-
-        Only works with live funko.com data (GitHub has no prices).
-
-        Args:
-            previous_products: Dict of product_id -> product data.
-
-        Returns:
-            List of products with price drops.
-        """
-        logger.info("Checking for price drops")
-
-        html = self._fetch_page(self.sale_url)
-        if not html:
-            logger.info("No live data for price drop check")
-            return []
-
-        current = self._parse_sale_page(html)
-        drops = []
-
-        for product in current:
-            pid = product["id"]
-            if pid in previous_products:
-                old_price = previous_products[pid].get("price", 0)
-                new_price = product["price"]
-                if old_price > 0 and new_price < old_price:
-                    product["original_price"] = old_price
-                    product["price_drop"] = round(old_price - new_price, 2)
-                    drops.append(product)
-                    logger.info(
-                        f"Price drop: {product['name']} €{old_price} -> €{new_price}"
-                    )
-
-        logger.info(f"Found {len(drops)} price drops")
-        return drops

@@ -1,0 +1,31 @@
+# Ruff config lives here rather than in pyproject.toml on purpose: the
+# project has no packaging metadata, and pytest discovers its rootdir
+# through pytest.ini. Adding a pyproject.toml would change that for no
+# benefit.
+
+line-length = 88
+target-version = "py311"
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "G",    # logging format
+]
+
+ignore = [
+    # The bot must degrade rather than die: a single unparseable tile,
+    # failed image, or failed post may not take down the scrape loop or
+    # the scheduler thread. Each site is commented.
+    "BLE001",
+    # f-strings in log calls are the established style across this repo;
+    # converting them all would churn every module for no behaviour change.
+    "G004",
+]
+
+[lint.per-file-ignores]
+# Tests reach into private helpers on purpose to assert what was persisted.
+"tests/*" = ["SLF001", "E402"]

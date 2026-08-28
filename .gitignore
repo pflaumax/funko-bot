@@ -38,6 +38,8 @@ data/images/*
 logs/*.log
 !logs/.gitkeep
 data/posted_products.json
+data/posted_products.corrupt-*.json
+data/product_queue.json
 
 # IDE
 .vscode/

@@ -7,20 +7,30 @@ and post updates on a scheduled interval.
 import json
 import logging
 import signal
-import sys
-from typing import Dict, Set
+import time
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import schedule
 
-from config.settings import config, POSTED_PRODUCTS_FILE, IMAGES_DIR
+from config.settings import DATA_DIR, IMAGES_DIR, POSTED_PRODUCTS_FILE, config
 from src.bot import FunkoBlueskyBot
-from src.scraper import FunkoScraper
 from src.image_handler import ImageHandler
-
+from src.post_formatter import format_post_text
+from src.scraper import FunkoScraper, clean_product_name, product_key
 
 logger = logging.getLogger("funko_bot.scheduler")
+
+# Ring buffer size for data/posted_products.json. At the default 8 posts
+# a day this holds roughly 8 months of history in ~300KB.
+MAX_POSTED_ENTRIES = 2000
+
+# Scraped products waiting to be posted. One scrape yields ~45 unposted
+# products but a cycle posts one, so without this the other ~44 were thrown
+# away and re-fetched three hours later: five requests and ~4 minutes of
+# anti-detection delays per single post, which is also what was drawing the
+# 403s. Refetched once a day so prices do not go stale.
+QUEUE_FILE = DATA_DIR / "product_queue.json"
+QUEUE_MAX_AGE_HOURS = 24
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -33,8 +43,58 @@ def signal_handler(signum, frame):
     shutdown_requested = True
 
 
-def load_posted_products() -> Dict[str, Dict]:
+def _write_json(path, payload) -> None:
+    """Write JSON atomically: tmp file, then rename over the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    tmp_path.replace(path)
+
+
+def _migrate_keys(products: dict[str, dict]) -> dict[str, dict]:
+    """Re-key entries written before the product-name fix.
+
+    Entries used to be keyed on md5("{noisy name}_{url}"), where the name
+    still carried the CDN's ", , hi-res view 1" suffix. The key is now
+    md5(cleaned, casefolded name). Without this pass every historical
+    product looks unseen and the bot reposts its entire back catalogue.
+
+    Args:
+        products: Ledger as loaded from disk.
+
+    Returns:
+        The ledger keyed under the current scheme.
+    """
+    migrated: dict[str, dict] = {}
+    changed = 0
+
+    for key, entry in products.items():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "")
+        if not name:
+            migrated[key] = entry
+            continue
+
+        entry["name"] = clean_product_name(name)
+        new_key = product_key(name)
+        if new_key != key:
+            changed += 1
+        migrated.setdefault(new_key, entry)
+
+    if changed:
+        logger.info(f"Migrated {changed} ledger entries to the current key scheme")
+    return migrated
+
+
+def load_posted_products() -> dict[str, dict]:
     """Load previously posted products from JSON file.
+
+    The file is hand-editable and lives on an SD card, so its shape is
+    normalised rather than trusted: under systemd's Restart=always a
+    KeyError here would become a restart loop, and treating a corrupt file
+    as "nothing posted" would repost the whole back catalogue.
 
     Returns:
         Dict mapping product_id to product data.
@@ -44,346 +104,173 @@ def load_posted_products() -> Dict[str, Dict]:
         return {}
 
     try:
-        with open(POSTED_PRODUCTS_FILE, "r", encoding="utf-8") as f:
+        with open(POSTED_PRODUCTS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        logger.info(f"Loaded {len(data)} previously posted products")
-        return data
-    except Exception as e:
+    except (json.JSONDecodeError, OSError) as e:
         logger.error(f"Failed to load posted products: {e}")
+        _quarantine_ledger()
         return {}
 
+    if not isinstance(data, dict):
+        logger.error("Posted products file is not an object; ignoring it")
+        _quarantine_ledger()
+        return {}
 
-def save_posted_products(products: Dict[str, Dict]) -> None:
-    """Save posted products to JSON file.
+    data = _migrate_keys(data)
+    logger.info(f"Loaded {len(data)} previously posted products")
+    return data
+
+
+def _quarantine_ledger() -> None:
+    """Move an unreadable ledger aside instead of silently overwriting it.
+
+    Losing the ledger means reposting everything, so the bad file is kept
+    for inspection rather than clobbered by the next save.
+    """
+    try:
+        backup = POSTED_PRODUCTS_FILE.with_suffix(
+            f".corrupt-{datetime.now():%Y%m%d%H%M%S}.json"
+        )
+        POSTED_PRODUCTS_FILE.rename(backup)
+        logger.error(f"Moved unreadable ledger to {backup.name}")
+    except OSError as e:
+        logger.error(f"Could not quarantine the ledger: {e}")
+
+
+def _sort_key(entry: dict) -> str:
+    """Sort ledger entries oldest-first by posting time."""
+    return str(entry.get("posted_at") or "")
+
+
+def save_posted_products(products: dict[str, dict]) -> None:
+    """Save posted products to JSON file, atomically.
+
+    Trimmed to a ring buffer rather than a time window. A 90-day cutoff
+    used to drop ~37 entries per cycle, which put those products back in
+    the queue to be reposted; a bounded count never does.
 
     Args:
         products: Dict mapping product_id to product data.
     """
     try:
-        # Cleanup old entries (older than 90 days)
-        cutoff_date = datetime.now() - timedelta(days=90)
-        cleaned_products = {}
-
-        for product_id, product_data in products.items():
-            posted_at_str = product_data.get("posted_at", "")
-            try:
-                posted_at = datetime.fromisoformat(posted_at_str)
-                if posted_at > cutoff_date:
-                    cleaned_products[product_id] = product_data
-            except (ValueError, TypeError):
-                # Keep if we can't parse date
-                cleaned_products[product_id] = product_data
-
-        removed_count = len(products) - len(cleaned_products)
-        if removed_count > 0:
-            logger.info(f"Removed {removed_count} old product entries")
-
-        # Save to file
-        POSTED_PRODUCTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(POSTED_PRODUCTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(cleaned_products, f, indent=2, ensure_ascii=False)
-
-        logger.debug(f"Saved {len(cleaned_products)} posted products")
-
-    except Exception as e:
-        logger.error(f"Failed to save posted products: {e}", exc_info=True)
-
-
-def extract_hashtag_from_license(license_name: str, name: str = "") -> str:
-    """Extract a hashtag from product license (scraped from website).
-
-    The license field from the website contains the specific series name
-    (e.g., "Chainsaw Man", "Spider-Man", "Harry Potter") which makes
-    perfect hashtags. For generic licenses (Marvel, DC), extracts character
-    name from product name.
-
-    Args:
-        license_name: License/series name from website (e.g., "Chainsaw Man")
-        name: Product name as fallback
-
-    Returns:
-        Hashtag without spaces (e.g., "ChainsawMan", "SpiderMan")
-    """
-    # Use license name if available
-    source = license_name if license_name else name
-
-    # If license is generic (Marvel, DC, Anime, etc.), try to extract specific character from name
-    generic_licenses = ["marvel", "dc", "anime", "disney", "star wars", "gaming"]
-    if source.lower() in generic_licenses and name:
-        # Try to extract character/series name from product name
-        # Examples: "Pop! Spider-Man" -> "Spider-Man", "Pop! Batman" -> "Batman"
-        name_clean = name.replace("Pop!", "").replace("Plus", "").strip()
-
-        # Common character patterns to look for
-        characters = [
-            "Spider-Man",
-            "Iron Man",
-            "Captain America",
-            "Black Widow",
-            "Thor",
-            "Hulk",
-            "Wolverine",
-            "Deadpool",
-            "Venom",
-            "Batman",
-            "Superman",
-            "Wonder Woman",
-            "Harley Quinn",
-            "Joker",
-            "Flash",
-            "Aquaman",
-            "Green Lantern",
-        ]
-
-        for char in characters:
-            if char.lower() in name_clean.lower():
-                source = char
-                break
-        else:
-            # If no character match, try to get first meaningful word from name
-            words = name_clean.split()
-            if words:
-                source = words[0]
-
-    # Remove common prefixes
-    source = source.replace("Pop!", "").strip()
-
-    # Convert to PascalCase hashtag (remove spaces, capitalize each word)
-    words = source.split()
-    hashtag = "".join(word.capitalize() for word in words if word)
-
-    # Remove special characters, keep only alphanumeric
-    hashtag = "".join(c for c in hashtag if c.isalnum())
-
-    return hashtag if hashtag else "FunkoPop"
-
-
-def format_post_text(product: Dict) -> str:
-    """Format post text for a product based on page type and status.
-
-    Args:
-        product: Product dictionary.
-
-    Returns:
-        Formatted post text.
-    """
-    fandom = product.get("fandom", "")
-    name = product.get("name", "Unknown Product")
-    price = product.get("price", 0)
-    original_price = product.get("original_price", 0)
-    price_drop = product.get("price_drop", 0)
-    product_url = product.get("product_url", "")
-    currency = product.get("currency", "EUR")
-    badge = product.get("badge", "")
-    page_type = product.get("page_type", "sale")
-    availability = product.get("availability", "In Stock")
-    drop_date = product.get("drop_date")
-
-    # Currency symbol
-    currency_symbols = {
-        "EUR": "€",
-        "USD": "$",
-        "GBP": "£",
-    }
-    sym = currency_symbols.get(currency, currency)
-
-    # Generate hashtags
-    license_name = product.get("license", "")
-    series_hashtag = extract_hashtag_from_license(license_name, name)
-    hashtags = f"#{series_hashtag} #Funko #FunkoPop"
-
-    # Fandom tag (always show real fandom)
-    fandom_tag = f"[{fandom}]" if fandom and fandom != "Other" else ""
-
-    # Product line - ALWAYS show ✨ emoji, with badge if it exists
-    if badge and badge.lower() != "null":
-        product_line = f"✨ {badge} {name}\n"
-    else:
-        product_line = f"✨ {name}\n"
-
-    # Determine post type based on page_type and product status
-    # Priority: Coming Soon > Sale > Page Type
-
-    if availability == "Coming Soon" or drop_date:
-        # Coming Soon / Pre-order
-        emoji = "🔜"
-        status = "COMING SOON"
-
-        if drop_date:
-            drop_line = f"Drops {drop_date}\n"
-        else:
-            drop_line = ""
-
-        if price > 0:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"{drop_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"{drop_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
+        if len(products) > MAX_POSTED_ENTRIES:
+            ordered = sorted(products.items(), key=lambda kv: _sort_key(kv[1]))
+            dropped = len(products) - MAX_POSTED_ENTRIES
+            products = dict(ordered[dropped:])
+            logger.info(
+                f"Ledger trimmed to {MAX_POSTED_ENTRIES} entries "
+                f"({dropped} oldest dropped)"
             )
 
-    elif price_drop > 0 and original_price > 0:
-        # Sale item with price drop
-        emoji = "🏷️"
-        status = "SALE"
+        # Atomic: a power cut mid-write must not leave a truncated ledger.
+        _write_json(POSTED_PRODUCTS_FILE, products)
 
-        text = (
-            f"{emoji} {status} {fandom_tag}\n"
-            f"{product_line}"
-            f"Was: {sym}{original_price:.2f} → Now: {sym}{price:.2f}\n"
-            f"\n"
-            f"🔗 {product_url}\n"
-            f"\n"
-            f"{hashtags}"
+        logger.debug(f"Saved {len(products)} posted products")
+
+    except OSError as e:
+        logger.exception(f"Failed to save posted products: {e}")
+
+
+def load_queue() -> list[dict]:
+    """Load the pending product queue, or an empty list if it is unusable.
+
+    Returns:
+        Queued products, oldest scrape first. Empty when the file is
+        missing, malformed, or older than QUEUE_MAX_AGE_HOURS.
+    """
+    if not QUEUE_FILE.exists():
+        return []
+
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not read product queue: {e}")
+        return []
+
+    if not isinstance(data, dict) or not isinstance(data.get("products"), list):
+        logger.warning("Product queue has an unexpected shape; ignoring it")
+        return []
+
+    try:
+        fetched_at = datetime.fromisoformat(data.get("fetched_at", ""))
+    except (TypeError, ValueError):
+        logger.warning("Product queue has no readable timestamp; refetching")
+        return []
+
+    age = datetime.now() - fetched_at
+    if age > timedelta(hours=QUEUE_MAX_AGE_HOURS):
+        logger.info(
+            f"Product queue is {age.total_seconds() / 3600:.1f}h old; refetching"
         )
+        return []
 
-    elif page_type == "new-releases":
-        # New releases
-        emoji = "🆕"
-        status = "NEW RELEASE"
+    products = [p for p in data["products"] if isinstance(p, dict) and p.get("id")]
+    logger.info(
+        f"Product queue: {len(products)} pending, "
+        f"{age.total_seconds() / 3600:.1f}h old"
+    )
+    return products
 
-        if price > 0:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
 
-    elif page_type == "back-in-stock":
-        # Back in stock
-        emoji = "🔄"
-        status = "BACK IN STOCK"
+def save_queue(products: list[dict]) -> None:
+    """Persist the pending product queue.
 
-        if price > 0:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
+    Args:
+        products: Products still waiting to be posted.
+    """
+    try:
+        _write_json(
+            QUEUE_FILE,
+            {"fetched_at": datetime.now().isoformat(), "products": products},
+        )
+    except OSError as e:
+        logger.error(f"Failed to save product queue: {e}")
 
-    elif page_type == "exclusives":
-        # Exclusives
-        emoji = "⭐"
-        status = "EXCLUSIVE"
 
-        if price > 0:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
+def take_products(
+    scraper: FunkoScraper,
+    posted_products: dict[str, dict],
+    count: int,
+) -> list[dict]:
+    """Return the next products to post, scraping only when the queue is dry.
 
-    elif page_type == "best-selling":
-        # Best selling
-        emoji = "🔥"
-        status = "BEST SELLER"
+    Args:
+        scraper: Funko scraper instance.
+        posted_products: Ledger of what has already gone out.
+        count: How many products to take. 0 means every pending product.
 
-        if price > 0:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {status} {fandom_tag}\n"
-                f"{product_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
+    Returns:
+        Products to post this cycle, possibly empty.
+    """
+    queue = [p for p in load_queue() if p["id"] not in posted_products]
 
+    if not queue:
+        logger.info("Queue empty — scraping funko.com")
+        scraped = scraper.get_new_products(config.fandoms)
+        queue = [p for p in scraped if p["id"] not in posted_products]
+        logger.info(f"Scrape produced {len(queue)} unposted products")
+
+    taken = queue[:count] if count > 0 else queue
+
+    # A dry run publishes nothing, so it must not consume the queue either.
+    if config.dry_run:
+        logger.info("[DRY RUN] Queue left untouched")
     else:
-        # Default / Sale page without discount
-        emoji = "🏷️"
-        status = "Funko Pop"
+        save_queue(queue[len(taken):])
 
-        if price > 0:
-            text = (
-                f"{emoji} {fandom_tag} {status}\n"
-                f"{product_line}"
-                f"Price: {sym}{price:.2f}\n"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-        else:
-            text = (
-                f"{emoji} {fandom_tag} {status}\n"
-                f"{product_line}"
-                f"\n"
-                f"🔗 {product_url}\n"
-                f"\n"
-                f"{hashtags}"
-            )
-
-    return text
+    if taken:
+        logger.info(f"Taking {len(taken)} product(s), {len(queue) - len(taken)} left")
+    else:
+        logger.warning("Nothing to post this cycle")
+    return taken
 
 
 def main_check_job(
     bot: FunkoBlueskyBot,
     scraper: FunkoScraper,
     image_handler: ImageHandler,
-    posted_products: Dict[str, Dict],
+    posted_products: dict[str, dict],
     max_posts_per_check: int = 0,
     post_delay_seconds: int = 0,
 ) -> None:
@@ -402,26 +289,9 @@ def main_check_job(
     logger.info("=" * 60)
 
     try:
-        # Get new products
-        new_products = scraper.get_new_products(config.fandoms)
-        logger.info(f"Found {len(new_products)} products matching fandoms")
-
-        # Filter out already posted products
-        products_to_post = []
-        for product in new_products:
-            product_id = product["id"]
-            if product_id not in posted_products:
-                products_to_post.append(product)
-
-        logger.info(f"Found {len(products_to_post)} new products to post")
-
-        # Apply rate limiting
-        if max_posts_per_check > 0 and len(products_to_post) > max_posts_per_check:
-            logger.info(
-                f"Rate limiting: {len(products_to_post)} products found, "
-                f"posting only {max_posts_per_check} this check"
-            )
-            products_to_post = products_to_post[:max_posts_per_check]
+        products_to_post = take_products(
+            scraper, posted_products, max_posts_per_check
+        )
 
         # Post each new product
         posts_made = 0
@@ -434,8 +304,6 @@ def main_check_job(
                 # Add delay between posts (except for first post)
                 if posts_made > 0 and post_delay_seconds > 0:
                     logger.info(f"Waiting {post_delay_seconds}s before next post...")
-                    import time
-
                     time.sleep(post_delay_seconds)
 
                 # Download and prepare images (returns list)
@@ -447,7 +315,7 @@ def main_check_job(
 
                 # Generate alt text for each image
                 alt_texts = []
-                for i, img_path in enumerate(image_paths):
+                for i in range(len(image_paths)):
                     if i == 0:
                         # Main image - standard alt text
                         alt_texts.append(image_handler.generate_alt_text(product))
@@ -479,11 +347,10 @@ def main_check_job(
                     logger.error(f"Failed to post: {product['name']}")
 
             except Exception as e:
-                logger.error(
-                    f"Error posting product {product.get('name', 'unknown')}: {e}",
-                    exc_info=True,
+                # Graceful degradation: one bad product must not end the cycle.
+                logger.exception(
+                    f"Error posting product {product.get('name', 'unknown')}: {e}"
                 )
-                # Continue with next product (graceful degradation)
                 continue
 
         # Log posting summary
@@ -498,7 +365,7 @@ def main_check_job(
         logger.info("Scheduled check completed successfully")
 
     except Exception as e:
-        logger.error(f"Error in main check job: {e}", exc_info=True)
+        logger.exception(f"Error in main check job: {e}")
 
 
 def run_scheduler(
@@ -553,13 +420,11 @@ def run_scheduler(
     while not shutdown_requested:
         try:
             schedule.run_pending()
-            import time
-
             time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
             break
         except Exception as e:
-            logger.error(f"Error in scheduler loop: {e}", exc_info=True)
+            logger.exception(f"Error in scheduler loop: {e}")
 
     logger.info("Scheduler stopped gracefully")

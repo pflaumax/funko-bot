@@ -5,14 +5,14 @@ This script initializes the bot, scraper, and scheduler to monitor
 Funko Pop products and post updates to Bluesky.
 """
 
-import sys
 import argparse
 import logging
+import sys
 
 from config.settings import config, logger
 from src.bot import FunkoBlueskyBot
-from src.scraper import FunkoScraper
 from src.scheduler import run_scheduler
+from src.scraper import FunkoScraper
 
 
 def parse_arguments():
@@ -76,7 +76,6 @@ def main():
     logger.info(f"Bluesky Handle: {config.bluesky_handle}")
     logger.info(f"Check Interval: {config.check_interval_minutes} minutes")
     logger.info(f"Monitoring Fandoms: {', '.join(config.fandoms)}")
-    logger.info(f"Price Drop Threshold: ${config.price_drop_threshold}")
     logger.info(f"Test Mode: {config.test_mode}")
     logger.info(f"Dry Run: {config.dry_run}")
     logger.info("=" * 60)
