@@ -8,7 +8,7 @@ Automated Bluesky bot that monitors Funko.com for new products, sales, and resto
 - Posts product updates with high-quality images to Bluesky
 - Automatic fandom filtering (excludes sports leagues, Disney, etc.)
 - Configurable posting schedule and rate limiting
-- Multi-region support (EUR, GBP, USD)
+- Multi-region support: posts the storefront's own price in USD, GBP or EUR, never a conversion
 - Automatic image cleanup and log rotation
 - Duplicate detection to avoid reposting
 
@@ -52,7 +52,7 @@ Required settings:
 ```env
 BLUESKY_HANDLE=your-bot-handle.bsky.social
 BLUESKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-FUNKO_REGION=pl
+FUNKO_REGION=us
 SCRAPE_PAGES=sale,new-releases,back-in-stock,exclusives,best-selling
 ```
 
@@ -88,7 +88,7 @@ python main.py --once
 | `BLUESKY_HANDLE` | Your bot's Bluesky handle | Required |
 | `BLUESKY_APP_PASSWORD` | App password from Bluesky | Required |
 | `CHECK_INTERVAL_MINUTES` | Minutes between checks | 180 |
-| `FUNKO_REGION` | Region code (pl, gb, us) | pl |
+| `FUNKO_REGION` | Storefront to scrape, which sets the currency (us, gb, pl, de, …) | us |
 | `SCRAPE_PAGES` | Pages to scrape (comma-separated) | sale,new-releases,back-in-stock,exclusives,best-selling |
 | `MAX_POSTS_PER_CHECK` | Max posts per cycle (0=unlimited) | 1 |
 | `FANDOMS` | Fandoms to include (All or comma-separated) | All |

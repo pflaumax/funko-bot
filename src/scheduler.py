@@ -198,6 +198,16 @@ def load_queue() -> list[dict]:
         logger.warning("Product queue has no readable timestamp; refetching")
         return []
 
+    # Prices are storefront-specific and never converted, so a queue filled
+    # from another region would post dollars as euros until it drained.
+    queued_region = data.get("region")
+    if queued_region is not None and queued_region != config.funko_region:
+        logger.info(
+            f"Product queue is from region {queued_region!r}, now "
+            f"{config.funko_region!r}; refetching"
+        )
+        return []
+
     age = datetime.now() - fetched_at
     if age > timedelta(hours=QUEUE_MAX_AGE_HOURS):
         logger.info(
@@ -222,7 +232,11 @@ def save_queue(products: list[dict]) -> None:
     try:
         _write_json(
             QUEUE_FILE,
-            {"fetched_at": datetime.now().isoformat(), "products": products},
+            {
+                "fetched_at": datetime.now().isoformat(),
+                "region": config.funko_region,
+                "products": products,
+            },
         )
     except OSError as e:
         logger.error(f"Failed to save product queue: {e}")

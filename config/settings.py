@@ -140,7 +140,7 @@ class BotConfig:
             log_level=log_level,
             test_mode=_bool_env("TEST_MODE"),
             dry_run=_bool_env("DRY_RUN"),
-            funko_region=os.getenv("FUNKO_REGION", "pl").strip().lower(),
+            funko_region=os.getenv("FUNKO_REGION", "us").strip().lower(),
             max_posts_per_check=_number_env(
                 "MAX_POSTS_PER_CHECK", "0", int, minimum=0
             ),
