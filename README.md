@@ -14,7 +14,7 @@ Automated Bluesky bot that monitors Funko.com for new products, sales, and resto
 
 ## Requirements
 
-- Python 3.10 or higher
+- Python 3.12 or higher
 - Bluesky account with app password
 - 500MB+ free disk space
 
@@ -74,9 +74,9 @@ Test mode (no actual posts):
 python main.py --dry-run
 ```
 
-Single post test:
+Single cycle, then exit:
 ```bash
-python test_single_post.py
+python main.py --once
 ```
 
 ## Configuration
@@ -92,6 +92,7 @@ python test_single_post.py
 | `SCRAPE_PAGES` | Pages to scrape (comma-separated) | sale,new-releases,back-in-stock,exclusives,best-selling |
 | `MAX_POSTS_PER_CHECK` | Max posts per cycle (0=unlimited) | 1 |
 | `FANDOMS` | Fandoms to include (All or comma-separated) | All |
+| `SCRAPE_DELAY_MIN` / `SCRAPE_DELAY_MAX` | Random delay per request, seconds | 3 / 8 |
 | `LOG_LEVEL` | Logging level (INFO, DEBUG) | INFO |
 
 ### Posting Schedule
@@ -159,6 +160,7 @@ funko-bluesky-bot/
 │   └── settings.py          # Configuration management
 ├── data/
 │   ├── images/              # Temporary image storage
+│   ├── product_queue.json   # Scraped products awaiting posting
 │   └── posted_products.json # Posted products tracking
 ├── logs/
 │   └── bot.log              # Application logs
@@ -169,6 +171,7 @@ funko-bluesky-bot/
 │   ├── bot.py               # Bluesky API client
 │   ├── scraper.py           # Funko.com scraper
 │   ├── image_handler.py     # Image processing
+│   ├── post_formatter.py    # Post text and hashtags
 │   └── scheduler.py         # Job scheduling
 ├── tests/
 │   ├── test_scraper.py      # Unit tests

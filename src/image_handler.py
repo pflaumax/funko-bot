@@ -4,21 +4,20 @@ This module handles downloading, resizing, and managing product images
 for posting to Bluesky.
 """
 
-import os
 import logging
 import time
-from typing import Optional, Tuple
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import requests
 from PIL import Image
 
-
 logger = logging.getLogger("funko_bot.image_handler")
 
 DEFAULT_MAX_SIZE = (1200, 1200)  # Larger max size for better quality
-IMAGE_QUALITY = 95  # Higher quality JPEG compression
+IMAGE_QUALITY = 95  # Starting rung of the quality ladder
+MIN_QUALITY = 40  # Below this, artefacts are worse than a bigger upload
+MAX_UPLOAD_BYTES = 950_000  # Bluesky rejects blobs around 1MB
 DOWNLOAD_TIMEOUT = 30
 
 
@@ -39,7 +38,7 @@ class ImageHandler:
         self.images_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Image handler initialized with directory: {images_dir}")
 
-    def download_image(self, url: str, save_path: str) -> Optional[str]:
+    def download_image(self, url: str, save_path: str) -> str | None:
         """Download an image from URL to local path.
 
         Args:
@@ -79,53 +78,71 @@ class ImageHandler:
             logger.error(f"Failed to download image from {url}: {e}")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error downloading image: {e}", exc_info=True)
+            logger.exception(f"Unexpected error downloading image: {e}")
             return None
 
     def resize_image(
-        self, image_path: str, max_size: Tuple[int, int] = DEFAULT_MAX_SIZE
-    ) -> Optional[str]:
-        """Resize image to fit within max dimensions while maintaining aspect ratio.
+        self, image_path: str, max_size: tuple[int, int] = DEFAULT_MAX_SIZE
+    ) -> str | None:
+        """Normalise an image to a JPEG that Bluesky will accept.
+
+        Every image is re-encoded, not just oversized ones. Funko serves
+        800x800 PNGs, which sat below the resize threshold and were being
+        uploaded byte-for-byte under a .jpg filename — ~590KB of PNG per
+        image where JPEG costs well under a tenth of that.
 
         Args:
-            image_path: Path to the image file.
-            max_size: Maximum (width, height) tuple.
+            image_path: Path to the image file. Rewritten in place.
+            max_size: Maximum (width, height).
 
         Returns:
-            Path to resized image, or None if resize fails.
+            Path to the prepared image, or None on failure.
         """
         try:
-            logger.info(f"Resizing image: {image_path}")
-
             with Image.open(image_path) as img:
-                original_format = img.format
-                original_mode = img.mode
+                img.load()
+                original_size = img.size
 
-                # Only resize if image is larger than max_size
-                if img.size[0] <= max_size[0] and img.size[1] <= max_size[1]:
-                    logger.info(f"Image already optimal size: {img.size}")
-                    return image_path
-
-                # Convert RGBA to RGB if saving as JPEG
-                if img.mode == "RGBA" and original_format != "PNG":
+                # Flatten any transparency onto white: product shots are cut
+                # out on alpha, and JPEG has no alpha channel to keep.
+                if img.mode in ("RGBA", "LA", "P"):
+                    img = img.convert("RGBA")
                     background = Image.new("RGB", img.size, (255, 255, 255))
-                    background.paste(img, mask=img.split()[3])
+                    background.paste(img, mask=img.split()[-1])
                     img = background
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
 
-                # Calculate new size maintaining aspect ratio
-                img.thumbnail(max_size, Image.Resampling.LANCZOS)
+                if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
+                    img.thumbnail(max_size, Image.Resampling.LANCZOS)
 
-                # Save with high quality - keep PNG if original was PNG
-                if original_format == "PNG" and original_mode == "RGBA":
-                    img.save(image_path, "PNG", optimize=True)
-                else:
-                    img.save(image_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
+                quality = IMAGE_QUALITY
+                while True:
+                    img.save(
+                        image_path,
+                        "JPEG",
+                        quality=quality,
+                        optimize=True,
+                        subsampling=0,
+                    )
+                    written = Path(image_path).stat().st_size
+                    if written <= MAX_UPLOAD_BYTES or quality <= MIN_QUALITY:
+                        break
+                    quality -= 10
 
-                logger.info(f"Image resized to {img.size}")
+                logger.info(
+                    f"Prepared {original_size} -> {img.size} JPEG q{quality}, "
+                    f"{written / 1024:.0f}KB"
+                )
+                if written > MAX_UPLOAD_BYTES:
+                    logger.warning(
+                        f"Image still {written / 1024:.0f}KB at q{quality}; "
+                        f"upload may be rejected"
+                    )
                 return image_path
 
-        except Exception as e:
-            logger.error(f"Failed to resize image {image_path}: {e}", exc_info=True)
+        except (OSError, ValueError) as e:
+            logger.exception(f"Failed to prepare image {image_path}: {e}")
             return None
 
     def generate_alt_text(self, product: dict) -> str:
@@ -183,7 +200,9 @@ class ImageHandler:
 
         try:
             for image_file in self.images_dir.glob("*"):
-                if image_file.is_file():
+                # Skip dotfiles: .gitkeep keeps this directory in the repo
+                # and is always older than the cutoff.
+                if image_file.is_file() and not image_file.name.startswith("."):
                     file_mtime = datetime.fromtimestamp(image_file.stat().st_mtime)
 
                     if file_mtime < cutoff_time:
@@ -195,10 +214,10 @@ class ImageHandler:
             return deleted_count
 
         except Exception as e:
-            logger.error(f"Error during image cleanup: {e}", exc_info=True)
+            logger.exception(f"Error during image cleanup: {e}")
             return deleted_count
 
-    def download_and_prepare(self, product: dict) -> Optional[list]:
+    def download_and_prepare(self, product: dict) -> list | None:
         """Download and prepare product images for posting.
 
         Args:

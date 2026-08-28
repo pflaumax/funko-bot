@@ -3,14 +3,16 @@
 This module handles environment variable loading, validation, and logging setup.
 """
 
-import os
 import logging
+import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import List
-from pathlib import Path
 from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
+from pathlib import Path
+from typing import Any, NoReturn
 
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +30,60 @@ IMAGES_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 
+def _fail(message: str) -> NoReturn:
+    """Report a bad setting and exit, rather than raise.
+
+    The systemd unit is Restart=always, so an exception raised while this
+    module is imported turns a one-character typo in .env into a restart
+    loop that logs only a traceback. Exiting deliberately with the reason
+    on stderr is the difference between a fixable error and a mystery.
+
+    Args:
+        message: What is wrong with the configuration.
+    """
+    print(f"CONFIG ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _number_env(
+    name: str, default: str, cast: Callable[[str], Any], minimum: float
+) -> Any:
+    """Read a numeric environment variable, or exit explaining why not.
+
+    Args:
+        name: Environment variable name.
+        default: Value used when the variable is unset.
+        cast: ``int`` or ``float``.
+        minimum: Smallest value that makes sense for this setting.
+
+    Returns:
+        The parsed number.
+    """
+    raw = os.getenv(name, default).strip()
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        _fail(f"{name} must be a number, got {raw!r}")
+    if value < minimum:
+        _fail(f"{name} must be at least {minimum}, got {value}")
+    return value
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable."""
+    raw = os.getenv(name, str(default)).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _list_env(name: str, default: str) -> list[str]:
+    """Read a comma-separated environment variable into a list."""
+    raw = os.getenv(name, default)
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        _fail(f"{name} must list at least one value, got {raw!r}")
+    return items
+
+
 @dataclass
 class BotConfig:
     """Bot configuration dataclass with type safety."""
@@ -35,15 +91,14 @@ class BotConfig:
     bluesky_handle: str
     bluesky_app_password: str
     check_interval_minutes: int
-    fandoms: List[str]
-    price_drop_threshold: float
+    fandoms: list[str]
     log_level: str
     test_mode: bool
     dry_run: bool
     funko_region: str
     max_posts_per_check: int
     post_delay_seconds: int
-    scrape_pages: List[str]
+    scrape_pages: list[str]
     scrape_delay_min: int
     scrape_delay_max: int
 
@@ -55,37 +110,44 @@ class BotConfig:
             BotConfig: Validated configuration object.
 
         Raises:
-            ValueError: If required environment variables are missing.
+            SystemExit: If any setting is missing or unparseable.
         """
-        bluesky_handle = os.getenv("BLUESKY_HANDLE")
-        bluesky_app_password = os.getenv("BLUESKY_APP_PASSWORD")
+        bluesky_handle = os.getenv("BLUESKY_HANDLE", "").strip()
+        bluesky_app_password = os.getenv("BLUESKY_APP_PASSWORD", "").strip()
 
         if not bluesky_handle or not bluesky_app_password:
-            raise ValueError(
-                "BLUESKY_HANDLE and BLUESKY_APP_PASSWORD must be set in .env file"
+            _fail("BLUESKY_HANDLE and BLUESKY_APP_PASSWORD must be set in .env")
+
+        log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+        if not hasattr(logging, log_level):
+            _fail(f"LOG_LEVEL must be a logging level name, got {log_level!r}")
+
+        scrape_delay_min = _number_env("SCRAPE_DELAY_MIN", "3", int, minimum=0)
+        scrape_delay_max = _number_env("SCRAPE_DELAY_MAX", "8", int, minimum=0)
+        if scrape_delay_max < scrape_delay_min:
+            _fail(
+                f"SCRAPE_DELAY_MAX ({scrape_delay_max}) must be at least "
+                f"SCRAPE_DELAY_MIN ({scrape_delay_min})"
             )
-
-        fandoms_str = os.getenv("FANDOMS", "Marvel,Star Wars,Disney,Anime")
-        fandoms = [f.strip() for f in fandoms_str.split(",")]
-
-        scrape_pages_str = os.getenv("SCRAPE_PAGES", "sale,new-releases,exclusives")
-        scrape_pages = [p.strip() for p in scrape_pages_str.split(",")]
 
         return cls(
             bluesky_handle=bluesky_handle,
             bluesky_app_password=bluesky_app_password,
-            check_interval_minutes=int(os.getenv("CHECK_INTERVAL_MINUTES", "15")),
-            fandoms=fandoms,
-            price_drop_threshold=float(os.getenv("PRICE_DROP_THRESHOLD", "10")),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
-            test_mode=os.getenv("TEST_MODE", "false").lower() == "true",
-            dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
-            funko_region=os.getenv("FUNKO_REGION", "pl"),
-            max_posts_per_check=int(os.getenv("MAX_POSTS_PER_CHECK", "0")),
-            post_delay_seconds=int(os.getenv("POST_DELAY_SECONDS", "0")),
-            scrape_pages=scrape_pages,
-            scrape_delay_min=int(os.getenv("SCRAPE_DELAY_MIN", "3")),
-            scrape_delay_max=int(os.getenv("SCRAPE_DELAY_MAX", "8")),
+            check_interval_minutes=_number_env(
+                "CHECK_INTERVAL_MINUTES", "15", int, minimum=1
+            ),
+            fandoms=_list_env("FANDOMS", "Marvel,Star Wars,Disney,Anime"),
+            log_level=log_level,
+            test_mode=_bool_env("TEST_MODE"),
+            dry_run=_bool_env("DRY_RUN"),
+            funko_region=os.getenv("FUNKO_REGION", "pl").strip().lower(),
+            max_posts_per_check=_number_env(
+                "MAX_POSTS_PER_CHECK", "0", int, minimum=0
+            ),
+            post_delay_seconds=_number_env("POST_DELAY_SECONDS", "0", int, minimum=0),
+            scrape_pages=_list_env("SCRAPE_PAGES", "sale,new-releases,exclusives"),
+            scrape_delay_min=scrape_delay_min,
+            scrape_delay_max=scrape_delay_max,
         )
 
 
@@ -156,7 +218,8 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
     )
     file_handler.setLevel(getattr(logging, log_level.upper()))
     file_format = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+        "%(asctime)s - %(name)s - %(levelname)s - "
+        "%(funcName)s:%(lineno)d - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     file_handler.setFormatter(file_format)
@@ -167,13 +230,8 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
     return logger
 
 
-# Initialize configuration and logger
-try:
-    config = BotConfig.from_env()
-    logger = setup_logging(config.log_level)
-    logger.info("Configuration loaded successfully")
-except Exception as e:
-    # Fallback logger if config fails
-    logging.basicConfig(level=logging.ERROR)
-    logging.error(f"Failed to load configuration: {e}")
-    raise
+# Initialize configuration and logger. Bad settings exit via _fail() with a
+# readable message; anything else here is a bug and should surface as one.
+config = BotConfig.from_env()
+logger = setup_logging(config.log_level)
+logger.info("Configuration loaded successfully")

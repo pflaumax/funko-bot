@@ -4,13 +4,11 @@ This module handles all interactions with the Bluesky API including
 authentication, posting, and image uploads.
 """
 
-import time
 import logging
-from typing import Optional, Dict
+import time
 from pathlib import Path
 
 from atproto import Client, models
-
 
 logger = logging.getLogger("funko_bot.bot")
 
@@ -66,7 +64,7 @@ class FunkoBlueskyBot:
                     logger.critical("Failed to authenticate after all retries")
                     raise
 
-    def upload_image(self, image_path: str) -> Optional[Dict]:
+    def upload_image(self, image_path: str) -> dict | None:
         """Upload an image to Bluesky and return blob reference.
 
         Args:
@@ -110,8 +108,8 @@ class FunkoBlueskyBot:
     def send_post(
         self,
         text: str,
-        image_paths: Optional[list] = None,
-        alt_texts: Optional[list] = None,
+        image_paths: list | None = None,
+        alt_texts: list | None = None,
     ) -> bool:
         """Send a post to Bluesky with optional images (up to 4).
 
@@ -224,7 +222,7 @@ class FunkoBlueskyBot:
                 return True
 
             except Exception as e:
-                logger.error(f"Post attempt {attempt} failed: {e}", exc_info=True)
+                logger.exception(f"Post attempt {attempt} failed: {e}")
                 if attempt < MAX_RETRIES:
                     backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
                     logger.info(f"Retrying in {backoff} seconds...")
