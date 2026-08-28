@@ -125,3 +125,28 @@ class TestDryRun:
         take_products(scraper, {}, count=1)
 
         assert [p["id"] for p in load_queue()] == before
+
+
+class TestRegionChange:
+    """Prices are never converted, so a queue must not outlive its region."""
+
+    def test_queue_from_another_region_is_discarded(self, queue_path, monkeypatch):
+        monkeypatch.setattr(scheduler.config, "funko_region", "pl")
+        save_queue(_products(5))
+        assert len(load_queue()) == 5
+
+        monkeypatch.setattr(scheduler.config, "funko_region", "us")
+        assert load_queue() == []
+
+    def test_same_region_is_kept(self, queue_path, monkeypatch):
+        monkeypatch.setattr(scheduler.config, "funko_region", "us")
+        save_queue(_products(3))
+        assert len(load_queue()) == 3
+
+    def test_queue_written_before_this_field_is_tolerated(self, queue_path):
+        queue_path.write_text(
+            json.dumps(
+                {"fetched_at": datetime.now().isoformat(), "products": _products(2)}
+            )
+        )
+        assert len(load_queue()) == 2

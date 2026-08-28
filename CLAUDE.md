@@ -61,6 +61,22 @@ Data flows one way: `scraper` → `scheduler` → (`image_handler`, `post_format
 
 Changing how a name is derived therefore **invalidates the entire dedup history** and reposts the back catalogue to a public feed. This already happened once in the making: image `alt` attributes carry a CDN suffix (`"Pop! Fuecoco, , hi-res view 1"`), which went into 461 live posts before the name moved to `div.product-name`. `_migrate_keys()` in the scheduler re-keys old entries on load and is what made that fix safe; `tests/test_ledger.py` pins it.
 
+### Storefronts and currency
+
+`FUNKO_REGION` picks which storefront is scraped, and that alone decides the currency of the posted price. **Nothing is ever converted** — the price posted is the price that storefront charges, read off the page. The default is `us` (USD).
+
+Three things differ between storefronts and all three are handled in `src/scraper.py`:
+
+- **URL shape.** The US store is the site root and takes no locale segment (`funko.com/new-featured/…`); `/us/new-featured/` 404s. `US_REGIONS` covers both `"us"` and `""`.
+- **Page slugs.** The US store calls one page `best-sellers` where the EU stores call it `best-selling`. `SCRAPE_PAGES` and the stored `page_type` keep the canonical EU name so `post_formatter.PAGE_STYLES` stays region-independent; only the URL is translated, via `_page_slug()`.
+- **Tile markup.** EU tiles carry `div.product-name`; US tiles only `.pdp-link`. `_parse_tile` walks a cascade ending at the image `alt`, which always needs `clean_product_name()`.
+
+Currency is read from the rendered symbol (`$14.99`, `€ 23,00`) rather than assumed, because the price markup has no structured currency field — `REGION_CURRENCY_MAP` is only the fallback.
+
+Switching regions is safe for dedup: `product_key()` hashes the name, and names are identical across storefronts, so products already posted stay suppressed. It is *not* safe for a queue already on disk, so `data/product_queue.json` records its region and is discarded when that changes — otherwise dollar prices would go out labelled as euros until the queue drained.
+
+`div.product-availability` is no longer rendered on either storefront, so coming-soon status comes from the `product-flag` badge instead. The parser still reads the old element when present, because it is the only source of a drop date.
+
 ### Cloudflare handling
 
 The scraper uses `curl_cffi` with `impersonate="chrome131"` (it previously used `cloudscraper`, which stopped working). On top of that: a fixed 2s `RATE_LIMIT_DELAY`, a random `SCRAPE_DELAY_MIN`–`SCRAPE_DELAY_MAX` sleep before every fetch, and on HTTP 403 one retry after 2–3× `SCRAPE_DELAY_MAX`.

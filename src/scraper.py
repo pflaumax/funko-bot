@@ -61,6 +61,26 @@ REGION_CURRENCY_MAP = {
     "us": "USD",  # US store (explicit)
 }
 
+# The US storefront is the site root: it takes no locale path segment, and
+# /us/new-featured/ 404s.
+US_REGIONS = frozenset({"", "us"})
+
+# ...and it names one of the pages differently. SCRAPE_PAGES keeps the
+# canonical name so post_formatter.PAGE_STYLES and stored page_type values
+# stay region-independent; only the URL is translated.
+US_PAGE_SLUGS = {
+    "best-selling": "best-sellers",
+}
+
+# Prices carry no structured currency field, only the rendered symbol
+# ("$14.99", "€ 23,00"), so the currency is read off the page and the
+# region map is used only as a fallback.
+CURRENCY_BY_SYMBOL = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+}
+
 
 # Fandoms never worth posting: sports leagues have no crossover with this
 # feed's audience, and Disney floods every page. Matched as substrings
@@ -144,24 +164,57 @@ class FunkoScraper:
         from config.settings import config
         
         self.session = curl_requests.Session(impersonate="chrome131")
-        self.region = region
-        self.currency = REGION_CURRENCY_MAP.get(region.lower(), "EUR")
+        self.region = (region or "").strip().lower()
+        self.is_us = self.region in US_REGIONS
+        self.currency = REGION_CURRENCY_MAP.get(self.region, "EUR")
         self.pages = pages or ["sale"]
         self.last_request_time = 0
         self.delay_min = config.scrape_delay_min
         self.delay_max = config.scrape_delay_max
 
-        # Build base URL
-        if region:
-            self.base_url = f"{FUNKO_BASE_URL}/{region}/new-featured"
-        else:
+        if self.is_us:
             self.base_url = f"{FUNKO_BASE_URL}/new-featured"
+        else:
+            self.base_url = f"{FUNKO_BASE_URL}/{self.region}/new-featured"
 
         logger.info(
-            f"Scraper initialized — region: {region or 'US'}, "
+            f"Scraper initialized — region: {self.region or 'US'}, "
             f"currency: {self.currency}, pages: {self.pages}, "
             f"delays: {self.delay_min}-{self.delay_max}s"
         )
+
+    def _page_slug(self, page_type: str) -> str:
+        """Translate a canonical page name into this region's URL slug.
+
+        Args:
+            page_type: Canonical name as listed in SCRAPE_PAGES.
+
+        Returns:
+            The slug to put in the URL.
+        """
+        if self.is_us:
+            return US_PAGE_SLUGS.get(page_type, page_type)
+        return page_type
+
+    @staticmethod
+    def _detect_currency(*elements) -> str | None:
+        """Read the currency from the symbol the page actually rendered.
+
+        Args:
+            elements: Price elements to inspect, in priority order. None
+                entries are skipped.
+
+        Returns:
+            Currency code, or None if no known symbol was present.
+        """
+        for element in elements:
+            if element is None:
+                continue
+            text = element.get_text()
+            for symbol, code in CURRENCY_BY_SYMBOL.items():
+                if symbol in text:
+                    return code
+        return None
 
     def _rate_limit(self) -> None:
         """Enforce rate limiting between requests."""
@@ -291,12 +344,22 @@ class FunkoScraper:
         if not img:
             return None
 
-        # div.product-name carries the bare title; the image alt is a
-        # fallback only, and always needs the CDN suffix stripped off.
-        name_el = tile.find("div", class_="product-name")
-        name = clean_product_name(
-            name_el.get_text(strip=True) if name_el else img.get("alt", "")
-        )
+        # Storefronts differ: the EU tiles carry div.product-name, the US
+        # ones only .pdp-link. The image alt is a last resort — it always
+        # has the CDN's ", , hi-res view 1" suffix on it.
+        name = ""
+        for finder in (
+            lambda: tile.find("div", class_="product-name"),
+            lambda: tile.find(class_="pdp-link"),
+            lambda: tile.find(class_="link"),
+        ):
+            element = finder()
+            if element:
+                name = clean_product_name(element.get_text(strip=True))
+                if name:
+                    break
+        if not name:
+            name = clean_product_name(img.get("alt", ""))
         if not name:
             return None
         image_url = img.get("src", "")
@@ -356,8 +419,10 @@ class FunkoScraper:
         else:
             badge = ""
 
-        # Check for "Coming Soon" status and extract drop date
-        coming_soon = False
+        # Coming-soon status. div.product-availability is the richer source
+        # — it carries the drop date — but the site no longer renders it on
+        # either storefront, so the badge is what actually fires in practice.
+        coming_soon = badge.casefold() == "coming soon"
         drop_date = None
         availability_el = tile.find("div", class_="product-availability")
         if availability_el:
@@ -398,7 +463,7 @@ class FunkoScraper:
             "drop_date": drop_date,
             "page_type": page_type,
             "source": "funko.com",
-            "currency": self.currency,
+            "currency": self._detect_currency(sales_el, strike_el) or self.currency,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -483,7 +548,7 @@ class FunkoScraper:
 
         # Scrape from each configured page
         for page_type in self.pages:
-            page_url = f"{self.base_url}/{page_type}/"
+            page_url = f"{self.base_url}/{self._page_slug(page_type)}/"
             logger.info(f"Scraping page: {page_type} ({page_url})")
 
             try:

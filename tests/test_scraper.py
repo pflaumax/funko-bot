@@ -84,3 +84,98 @@ class TestFunkoScraper:
         ]
         filtered = scraper.filter_by_fandom(products, ["All"])
         assert [p["name"] for p in filtered] == ["Spider-Man", "Darth Vader"]
+
+
+class TestStorefronts:
+    """The US storefront is the site root and names one page differently."""
+
+    def _scraper(self, region):
+        from src.scraper import FunkoScraper
+
+        return FunkoScraper(region=region, pages=["sale"])
+
+    def test_us_has_no_locale_prefix(self):
+        for region in ("us", "US", "", None):
+            assert self._scraper(region).base_url == (
+                "https://funko.com/new-featured"
+            )
+
+    def test_eu_keeps_its_locale_prefix(self):
+        assert self._scraper("pl").base_url == "https://funko.com/pl/new-featured"
+
+    def test_us_renames_the_best_sellers_page(self):
+        assert self._scraper("us")._page_slug("best-selling") == "best-sellers"
+
+    def test_other_pages_are_unchanged_on_us(self):
+        scraper = self._scraper("us")
+        for page in ("sale", "new-releases", "back-in-stock", "exclusives"):
+            assert scraper._page_slug(page) == page
+
+    def test_eu_never_translates_slugs(self):
+        assert self._scraper("pl")._page_slug("best-selling") == "best-selling"
+
+    def test_us_region_is_usd(self):
+        assert self._scraper("us").currency == "USD"
+        assert self._scraper("").currency == "USD"
+
+
+class TestCurrencyDetection:
+    """Currency is read off the page, not assumed from the region."""
+
+    def _sales(self, html):
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(html, "lxml").find("span")
+
+    def test_dollar(self, scraper):
+        el = self._sales('<span class="sales">$14.99</span>')
+        assert scraper._detect_currency(el) == "USD"
+
+    def test_euro(self, scraper):
+        el = self._sales('<span class="sales">€ 23,00</span>')
+        assert scraper._detect_currency(el) == "EUR"
+
+    def test_pound(self, scraper):
+        el = self._sales('<span class="sales">£12.00</span>')
+        assert scraper._detect_currency(el) == "GBP"
+
+    def test_no_symbol_returns_none(self, scraper):
+        el = self._sales('<span class="sales">14.99</span>')
+        assert scraper._detect_currency(el) is None
+
+    def test_none_elements_are_skipped(self, scraper):
+        el = self._sales('<span class="sales">$9.99</span>')
+        assert scraper._detect_currency(None, el) == "USD"
+
+    def test_falls_back_to_the_region_when_absent(self, scraper):
+        assert scraper._detect_currency(None) is None
+        assert scraper.currency == "EUR"
+
+
+class TestNameSources:
+    """Tile markup differs per storefront; every path must yield a bare name."""
+
+    def _tile(self, inner):
+        from bs4 import BeautifulSoup
+
+        return BeautifulSoup(
+            f'<div class="product-tile">'
+            f'<img class="tile-main-image" alt="Pop! X, , hi-res view 1" src="i.png"/>'
+            f"{inner}</div>",
+            "lxml",
+        ).find("div", class_="product-tile")
+
+    def test_eu_product_name_div(self, scraper):
+        tile = self._tile('<div class="product-name">Pop! Gus Fring (Bloody)</div>')
+        assert scraper._parse_tile(tile)["name"] == "Pop! Gus Fring (Bloody)"
+
+    def test_us_pdp_link(self, scraper):
+        tile = self._tile('<a class="pdp-link">Pop! Gus Fring (Bloody)</a>')
+        assert scraper._parse_tile(tile)["name"] == "Pop! Gus Fring (Bloody)"
+
+    def test_alt_is_the_last_resort_and_still_cleaned(self, scraper):
+        assert scraper._parse_tile(self._tile(""))["name"] == "Pop! X"
+
+    def test_empty_name_element_falls_through(self, scraper):
+        tile = self._tile('<div class="product-name"></div>')
+        assert scraper._parse_tile(tile)["name"] == "Pop! X"

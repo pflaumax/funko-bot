@@ -98,6 +98,24 @@ def _classify(product: dict) -> str:
     return "default"
 
 
+def _status(kind: str) -> str:
+    """Return the status word a headline kind uses.
+
+    Args:
+        kind: Result of _classify().
+
+    Returns:
+        The status text, e.g. "COMING SOON".
+    """
+    if kind == "coming_soon":
+        return COMING_SOON_STYLE[1]
+    if kind == "sale":
+        return SALE_STYLE[1]
+    if kind in PAGE_STYLES:
+        return PAGE_STYLES[kind][1]
+    return DEFAULT_STYLE[1]
+
+
 def _header(product: dict, kind: str) -> str:
     """Build the headline for a classified product.
 
@@ -165,9 +183,13 @@ def format_post_text(product: dict) -> str:
     currency = product.get("currency", "EUR")
     symbol = CURRENCY_SYMBOLS.get(currency, currency)
 
-    product_line = f"✨ {badge} {name}" if badge else f"✨ {name}"
-
     kind = _classify(product)
+
+    # Drop a badge the headline already says, so a coming-soon product does
+    # not read "🔜 COMING SOON / ✨ Coming Soon Pop! X".
+    if badge and badge.casefold() == _status(kind).casefold():
+        badge = ""
+    product_line = f"✨ {badge} {name}" if badge else f"✨ {name}"
 
     detail_lines: list[str] = []
     if kind == "coming_soon" and product.get("drop_date"):

@@ -123,3 +123,25 @@ class TestHashtags:
         assert extract_hashtag_from_license("Five Nights at Freddy's") == (
             "FiveNightsAtFreddys"
         )
+
+
+class TestComingSoonBadge:
+    """div.product-availability is gone from the site; the flag is the signal."""
+
+    def test_badge_drives_the_headline(self):
+        text = format_post_text(
+            _product(badge="Coming Soon", page_type="new-releases",
+                     availability="Coming Soon")
+        )
+        assert text.startswith("\U0001f51c COMING SOON")
+
+    def test_badge_is_not_repeated_in_the_body(self):
+        text = format_post_text(
+            _product(badge="Coming Soon", availability="Coming Soon")
+        )
+        assert "✨ Pop! Fuecoco" in text
+        assert "Coming Soon Pop!" not in text
+
+    def test_other_badges_are_still_shown(self):
+        text = format_post_text(_product(badge="Web Exclusive"))
+        assert "✨ Web Exclusive Pop! Fuecoco" in text

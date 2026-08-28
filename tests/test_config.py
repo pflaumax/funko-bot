@@ -65,7 +65,7 @@ class TestParsing:
         cfg = _load(monkeypatch).config
         assert cfg.check_interval_minutes == 15
         assert cfg.dry_run is False
-        assert cfg.funko_region == "pl"
+        assert cfg.funko_region == "us"
 
     def test_lists_are_split_and_trimmed(self, monkeypatch):
         cfg = _load(monkeypatch, SCRAPE_PAGES="sale, new-releases ,exclusives").config
