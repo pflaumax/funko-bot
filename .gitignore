@@ -36,9 +36,11 @@ ENV/
 data/images/*
 !data/images/.gitkeep
 logs/*.log
+logs/*.log.*
 !logs/.gitkeep
 data/posted_products.json
 data/posted_products.corrupt-*.json
+data/posted_products.backup-*.json
 data/product_queue.json
 
 # IDE
