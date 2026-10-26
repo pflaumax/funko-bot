@@ -56,7 +56,7 @@ venv/bin/python main.py --dry-run --once    # one cycle, nothing posted; without
 nano .env && sudo systemctl restart funko-bot                     # change a setting
 ```
 
-The Pi tracks `main`. `development`, GitHub's default branch, is older (6 commits behind `main` on 2026-10-26), so never check it out there.
+The Pi tracks `main`; deploy from `main`. `development` is GitHub's default branch and was fast-forwarded to `main` on 2026-10-26, but nothing keeps the two in step.
 
 **Never delete `data/posted_products.json` to "start fresh".** It is the dedup history; without it the bot reposts the whole back catalogue to the public feed, one product per cycle. Images older than 24h are pruned after every cycle, so `data/images/` needs no manual cleanup.
 
