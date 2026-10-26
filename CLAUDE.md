@@ -44,6 +44,22 @@ The Pi is reached through the SSH alias `pi` (user `reiberry`, key-based) — ru
 
 Deploy is `git pull` + `sudo systemctl restart funko-bot`. `.env` is gitignored and lives only on the Pi, so new settings must be added there by hand. A restart runs a check immediately, and unless `DRY_RUN=true` that is a real public post.
 
+Day-to-day commands on the Pi, run from `~/personal/funko-bot`:
+
+```bash
+sudo systemctl status funko-bot             # also: start | stop | restart | enable | disable
+sudo journalctl -u funko-bot -f             # live; -n 100 for the last 100 lines
+tail -f logs/bot.log                        # the app's own log file
+git pull && sudo systemctl restart funko-bot                      # deploy
+sudo systemctl daemon-reload && sudo systemctl restart funko-bot  # after editing /etc/systemd/system/funko-bot.service
+venv/bin/python main.py --dry-run --once    # one cycle, nothing posted; without --dry-run it posts
+nano .env && sudo systemctl restart funko-bot                     # change a setting
+```
+
+The Pi tracks `main`. `development`, GitHub's default branch, is older (6 commits behind `main` on 2026-10-26), so never check it out there.
+
+**Never delete `data/posted_products.json` to "start fresh".** It is the dedup history; without it the bot reposts the whole back catalogue to the public feed, one product per cycle. Images older than 24h are pruned after every cycle, so `data/images/` needs no manual cleanup.
+
 ## Architecture
 
 Data flows one way: `scraper` → `scheduler` → (`image_handler`, `post_formatter`, `bot`).
